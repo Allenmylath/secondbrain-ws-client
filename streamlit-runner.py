@@ -1,11 +1,12 @@
 import streamlit as st
 import websocket
-import threading
 import numpy as np
 import time
 import pyaudio
 import sounddevice as sd
 import os
+import asyncio
+import concurrent.futures
 from google.protobuf.descriptor_pool import DescriptorPool
 from google.protobuf.message_factory import MessageFactory
 
@@ -39,6 +40,12 @@ if 'play_time' not in st.session_state:
     st.session_state.play_time = 0
 if 'last_message_time' not in st.session_state:
     st.session_state.last_message_time = 0
+if 'executor' not in st.session_state:
+    st.session_state.executor = concurrent.futures.ThreadPoolExecutor(max_workers=3)
+if 'loop' not in st.session_state:
+    st.session_state.loop = None
+if 'tasks' not in st.session_state:
+    st.session_state.tasks = []
 
 # Main app
 st.title("Pipecat WebSocket Client")
@@ -50,6 +57,16 @@ server_url = st.text_input("WebSocket Server URL", value="ws://localhost:8765")
 # Status area
 status_area = st.empty()
 status_area.info(st.session_state.status)
+
+# Play audio using sounddevice in a ThreadPoolExecutor
+def play_audio(audio_data):
+    try:
+        # Convert to float32 for sounddevice
+        float_data = audio_data.astype(np.float32) / 32768.0
+        sd.play(float_data, SAMPLE_RATE)
+        sd.wait()  # Wait until audio is done playing
+    except Exception as e:
+        print(f"Error playing audio: {str(e)}")
 
 # WebSocket callback functions
 def on_message(ws, message):
@@ -70,18 +87,9 @@ def on_message(ws, message):
                 
             st.session_state.last_message_time = current_time
             
-            # Play audio
+            # Play audio in the thread pool
             if st.session_state.is_playing:
-                # Convert to float32 for sounddevice
-                float_data = audio_data.astype(np.float32) / 32768.0
-                
-                # Play audio in a separate thread to avoid blocking
-                threading.Thread(
-                    target=sd.play,
-                    args=(float_data, SAMPLE_RATE),
-                    daemon=True
-                ).start()
-                
+                st.session_state.executor.submit(play_audio, audio_data)
                 st.session_state.status = "Received audio data"
                 status_area.info(st.session_state.status)
     except Exception as e:
@@ -101,8 +109,9 @@ def on_open(ws):
     st.session_state.status = "WebSocket connection established"
     status_area.success(st.session_state.status)
     
-    # Start audio processing in a separate thread
-    threading.Thread(target=process_audio, args=(ws,), daemon=True).start()
+    # Start audio processing in the executor
+    future = st.session_state.executor.submit(process_audio, ws)
+    st.session_state.tasks.append(future)
 
 def process_audio(ws):
     try:
@@ -119,7 +128,6 @@ def process_audio(ws):
         )
         
         st.session_state.status = "Audio stream started"
-        status_area.info(st.session_state.status)
         
         # Process audio while the connection is active
         while st.session_state.is_playing and ws.sock and ws.sock.connected:
@@ -138,7 +146,6 @@ def process_audio(ws):
                 
             except Exception as e:
                 st.session_state.status = f"Error processing audio: {str(e)}"
-                status_area.error(st.session_state.status)
                 break
         
         # Close stream
@@ -148,7 +155,11 @@ def process_audio(ws):
         
     except Exception as e:
         st.session_state.status = f"Error in audio processing: {str(e)}"
-        status_area.error(st.session_state.status)
+
+# Async function to run WebSocket
+async def run_websocket(ws):
+    loop = asyncio.get_event_loop()
+    await loop.run_in_executor(None, ws.run_forever)
 
 def start_websocket():
     try:
@@ -169,10 +180,9 @@ def start_websocket():
         st.session_state.is_playing = True
         st.session_state.play_time = 0
         
-        # Start WebSocket in a separate thread
-        wst = threading.Thread(target=ws.run_forever)
-        wst.daemon = True
-        wst.start()
+        # Use ThreadPoolExecutor to run the WebSocket
+        future = st.session_state.executor.submit(ws.run_forever)
+        st.session_state.tasks.append(future)
         
         st.session_state.status = "Connecting to WebSocket server..."
         status_area.info(st.session_state.status)
@@ -188,6 +198,12 @@ def stop_websocket():
         if st.session_state.ws:
             st.session_state.ws.close()
             st.session_state.ws = None
+        
+        # Cancel any pending tasks
+        for task in st.session_state.tasks:
+            if not task.done():
+                task.cancel()
+        st.session_state.tasks = []
             
         st.session_state.status = "WebSocket connection stopped"
         status_area.warning(st.session_state.status)
@@ -195,6 +211,15 @@ def stop_websocket():
     except Exception as e:
         st.session_state.status = f"Error stopping WebSocket: {str(e)}"
         status_area.error(st.session_state.status)
+
+# Cleanup function for session shutdown
+def cleanup():
+    if hasattr(st.session_state, 'executor'):
+        st.session_state.executor.shutdown(wait=False)
+
+# Register cleanup handler
+import atexit
+atexit.register(cleanup)
 
 # UI controls
 col1, col2 = st.columns(2)
@@ -208,4 +233,3 @@ with col2:
     stop_button = st.button("Stop Audio", 
                             on_click=stop_websocket, 
                             disabled=not st.session_state.is_playing)
-
