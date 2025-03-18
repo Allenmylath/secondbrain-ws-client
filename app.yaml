@@ -1,0 +1,30 @@
+alerts:
+- rule: DEPLOYMENT_FAILED
+- rule: DOMAIN_FAILED
+features:
+- buildpack-stack=ubuntu-22
+ingress:
+  rules:
+  - component:
+      name: secondbrain-ws-client
+    match:
+      path:
+        prefix: /
+name: oyster-app
+region: blr
+services:
+- environment_slug: python
+  github:
+    branch: main
+    deploy_on_push: true
+    repo: Allenmylath/secondbrain-ws-client
+  http_port: 8080
+  instance_count: 1
+  instance_size_slug: apps-s-1vcpu-1gb
+  name: secondbrain-ws-client
+  run_command: streamlit run streamlit-runner.py --server.port=$PORT --server.address=0.0.0.0
+  source_dir: /
+  build_command: apt-get update && apt-get install -y portaudio19-dev libasound2-dev
+  packages:
+    - portaudio19-dev
+    - libasound2-dev
