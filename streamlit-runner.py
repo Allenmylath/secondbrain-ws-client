@@ -19,35 +19,11 @@ CHUNK_SIZE = 512
 FORMAT = pyaudio.paInt16
 PLAY_TIME_RESET_THRESHOLD_MS = 1.0
 
-# Check if frames_pb2.py exists, otherwise generate it
-if not os.path.exists("frames_pb2.py"):
-    try:
-        import subprocess
-        st.info("Generating protobuf classes from frames.proto...")
-        result = subprocess.run([
-            "python", "-m", "grpc_tools.protoc", 
-            "--proto_path=./", 
-            "--python_out=./", 
-            "frames.proto"
-        ], capture_output=True, text=True)
-        
-        if result.returncode != 0:
-            st.error(f"Error generating protobuf classes: {result.stderr}")
-        else:
-            st.success("Generated protobuf classes successfully")
-    except Exception as e:
-        st.error(f"Error generating protobuf classes: {str(e)}")
-        st.info("Please run this command manually:")
-        st.code("python -m grpc_tools.protoc --proto_path=./ --python_out=./ frames.proto")
-
-# Import the generated protobuf module
 try:
     import frames_pb2
     st.success("Successfully imported frames_pb2")
 except ImportError:
-    st.error("Could not import frames_pb2. Make sure frames.proto has been compiled.")
-    st.info("Please run this command manually:")
-    st.code("python -m grpc_tools.protoc --proto_path=./ --python_out=./ frames.proto")
+    st.error("Could not import frames_pb2. Make sure the build process generated this file.")
     st.stop()
 
 # Initialize session state
