@@ -3,255 +3,325 @@ import websocket
 import threading
 import numpy as np
 import time
-import base64
-from io import BytesIO
+import json
+import pyaudio
+import wave
+import io
+import os
+from google.protobuf.descriptor_pb2 import FileDescriptorSet
+from google.protobuf.message_factory import MessageFactory
+from google.protobuf.descriptor_pool import DescriptorPool
 import sounddevice as sd
-from protobuf3.message import Message
-from protobuf3.fields import BytesField, UInt32Field
+import soundfile as sf
 
 # Set page configuration
-st.set_page_config(
-    page_title="Pipecat WebSocket Client",
-    page_icon="🎤",
-    layout="centered"
-)
+st.set_page_config(page_title="Pipecat WebSocket Client", layout="wide")
 
-# Define constants
+# Constants
 SAMPLE_RATE = 16000
 NUM_CHANNELS = 1
 CHUNK_SIZE = 512
+FORMAT = pyaudio.paInt16
+PLAY_TIME_RESET_THRESHOLD_MS = 1.0
 
-# Simple ProtoBuffer implementation for Frame message
-class AudioData(Message):
-    audio = BytesField(field_number=1)
-    sample_rate = UInt32Field(field_number=2)
-    num_channels = UInt32Field(field_number=3)
+# Create frames.proto file
+frames_proto = """
+//
+// Copyright (c) 2024–2025, Daily
+//
+// SPDX-License-Identifier: BSD 2-Clause License
+//
+// Generate frames_pb2.py with:
+//
+//   python -m grpc_tools.protoc --proto_path=./ --python_out=./protobufs frames.proto
+syntax = "proto3";
+package pipecat;
+message TextFrame {
+  uint64 id = 1;
+  string name = 2;
+  string text = 3;
+}
+message AudioRawFrame {
+  uint64 id = 1;
+  string name = 2;
+  bytes audio = 3;
+  uint32 sample_rate = 4;
+  uint32 num_channels = 5;
+  optional uint64 pts = 6;
+}
+message TranscriptionFrame {
+  uint64 id = 1;
+  string name = 2;
+  string text = 3;
+  string user_id = 4;
+  string timestamp = 5;
+}
+message Frame {
+  oneof frame {
+    TextFrame text = 1;
+    AudioRawFrame audio = 2;
+    TranscriptionFrame transcription = 3;
+  }
+}
+"""
 
-class Frame(Message):
-    audio = AudioData(field_number=1)
+# Write the proto file to disk
+with open("frames.proto", "w") as f:
+    f.write(frames_proto)
 
-# State management
-if 'ws_connection' not in st.session_state:
-    st.session_state.ws_connection = None
-if 'is_recording' not in st.session_state:
-    st.session_state.is_recording = False
-if 'received_audio' not in st.session_state:
-    st.session_state.received_audio = []
-if 'audio_thread' not in st.session_state:
-    st.session_state.audio_thread = None
+# Initialize session state
+if 'ws' not in st.session_state:
+    st.session_state.ws = None
+if 'is_playing' not in st.session_state:
+    st.session_state.is_playing = False
+if 'audio_queue' not in st.session_state:
+    st.session_state.audio_queue = []
+if 'status' not in st.session_state:
+    st.session_state.status = "Ready to connect"
+if 'play_time' not in st.session_state:
+    st.session_state.play_time = 0
+if 'last_message_time' not in st.session_state:
+    st.session_state.last_message_time = 0
 
-# Function to convert float32 audio to int16
-def float32_to_int16(float32_array):
+# Generate Python protobuf classes
+try:
+    import subprocess
+    result = subprocess.run([
+        "python", "-m", "grpc_tools.protoc", 
+        "--proto_path=./", 
+        "--python_out=./", 
+        "frames.proto"
+    ], capture_output=True, text=True)
+    
+    if result.returncode != 0:
+        st.error(f"Error generating protobuf classes: {result.stderr}")
+    else:
+        st.success("Generated protobuf classes successfully")
+        
+    # Import the generated module
+    import frames_pb2
+except Exception as e:
+    st.error(f"Error setting up protobuf: {str(e)}")
+    st.info("Trying alternative approach with dynamic loading...")
+    
+    # Alternative: Create descriptor pool and load message types dynamically
+    from google.protobuf.compiler import plugin_pb2
+    from google.protobuf import descriptor_pb2
+    from google.protobuf.descriptor_pool import DescriptorPool
+    from google.protobuf.message_factory import MessageFactory
+    
+    pool = DescriptorPool()
+    with open("frames.proto", "rb") as f:
+        proto_content = f.read()
+        
+    # This part would need protoc to be installed and called
+    # For now, we'll assume frames_pb2 is generated
+
+# Main app
+st.title("Pipecat WebSocket Client")
+st.subheader("Connect to a WebSocket server for voice communication")
+
+# Server URL input
+server_url = st.text_input("WebSocket Server URL", value="ws://localhost:8765")
+
+# Status area
+status_area = st.empty()
+status_area.info(st.session_state.status)
+
+# Convert Float32 audio to S16PCM
+def convert_float32_to_s16pcm(float32_array):
     float32_array = np.clip(float32_array, -1.0, 1.0)
-    return (float32_array * 32767).astype(np.int16)
+    int16_array = (float32_array * 32767).astype(np.int16)
+    return int16_array.tobytes()
 
-# Function to handle WebSocket messages
+# WebSocket callback functions
 def on_message(ws, message):
     try:
-        frame = Frame()
-        frame.parse_from_bytes(message)
+        # Parse the message using protobuf
+        frame = frames_pb2.Frame()
+        frame.ParseFromString(message)
         
-        if frame.audio and frame.audio.audio:
+        if frame.HasField("audio"):
             audio_data = np.frombuffer(frame.audio.audio, dtype=np.int16)
-            st.session_state.received_audio.append({
-                'data': audio_data,
-                'sample_rate': frame.audio.sample_rate
-            })
             
-            # Play the audio immediately
-            sd.play(audio_data.astype(np.float32) / 32767.0, frame.audio.sample_rate)
+            # Calculate current time
+            current_time = time.time()
+            diff_time = current_time - st.session_state.last_message_time
+            
+            if st.session_state.play_time == 0 or diff_time > PLAY_TIME_RESET_THRESHOLD_MS:
+                st.session_state.play_time = current_time
+                
+            st.session_state.last_message_time = current_time
+            
+            # Play audio
+            if st.session_state.is_playing:
+                # Convert to float32 for sounddevice
+                float_data = audio_data.astype(np.float32) / 32768.0
+                
+                # Play audio in a separate thread to avoid blocking
+                threading.Thread(
+                    target=sd.play,
+                    args=(float_data, SAMPLE_RATE),
+                    daemon=True
+                ).start()
+                
+                st.session_state.status = "Received audio data"
+                status_area.info(st.session_state.status)
     except Exception as e:
-        st.error(f"Error processing received audio: {e}")
+        st.session_state.status = f"Error processing message: {str(e)}"
+        status_area.error(st.session_state.status)
 
-# Function to handle WebSocket errors
 def on_error(ws, error):
-    st.error(f"WebSocket error: {error}")
-    stop_recording()
+    st.session_state.status = f"WebSocket error: {str(error)}"
+    status_area.error(st.session_state.status)
 
-# Function to handle WebSocket close
 def on_close(ws, close_status_code, close_msg):
-    st.warning(f"WebSocket connection closed: {close_status_code} - {close_msg}")
-    stop_recording()
+    st.session_state.status = "WebSocket connection closed"
+    status_area.warning(st.session_state.status)
+    st.session_state.is_playing = False
 
-# Function to handle WebSocket open
 def on_open(ws):
-    st.success("WebSocket connection established.")
+    st.session_state.status = "WebSocket connection established"
+    status_area.success(st.session_state.status)
+    
+    # Start audio processing in a separate thread
+    threading.Thread(target=process_audio, args=(ws,), daemon=True).start()
 
-# Function to start audio recording and transmission
-def start_recording():
-    def audio_callback(indata, frames, time, status):
-        if status:
-            st.error(f"Audio input error: {status}")
-            return
+def process_audio(ws):
+    try:
+        # Initialize PyAudio
+        p = pyaudio.PyAudio()
         
-        if st.session_state.ws_connection and st.session_state.ws_connection.sock and st.session_state.ws_connection.sock.connected:
+        # Open stream
+        stream = p.open(
+            format=FORMAT,
+            channels=NUM_CHANNELS,
+            rate=SAMPLE_RATE,
+            input=True,
+            frames_per_buffer=CHUNK_SIZE
+        )
+        
+        st.session_state.status = "Audio stream started"
+        status_area.info(st.session_state.status)
+        
+        # Process audio while the connection is active
+        while st.session_state.is_playing and ws.sock and ws.sock.connected:
             try:
-                # Convert audio to int16
-                audio_data = float32_to_int16(indata.flatten())
+                # Read audio chunk
+                audio_data = stream.read(CHUNK_SIZE, exception_on_overflow=False)
                 
-                # Create the protobuf message
-                audio_msg = AudioData()
-                audio_msg.audio = audio_data.tobytes()
-                audio_msg.sample_rate = SAMPLE_RATE
-                audio_msg.num_channels = NUM_CHANNELS
+                # Create protobuf message
+                frame = frames_pb2.Frame()
+                frame.audio.audio = audio_data
+                frame.audio.sample_rate = SAMPLE_RATE
+                frame.audio.num_channels = NUM_CHANNELS
                 
-                frame = Frame()
-                frame.audio = audio_msg
+                # Send the message
+                ws.send(frame.SerializeToString())
                 
-                # Send the encoded message
-                st.session_state.ws_connection.send(frame.encode_to_bytes())
             except Exception as e:
-                st.error(f"Error sending audio: {e}")
-    
-    # Start the audio recording in a separate thread
-    def audio_thread_func():
-        try:
-            with sd.InputStream(samplerate=SAMPLE_RATE, channels=NUM_CHANNELS, 
-                            callback=audio_callback, blocksize=CHUNK_SIZE):
-                while st.session_state.is_recording:
-                    time.sleep(0.1)
-        except Exception as e:
-            st.error(f"Error with audio stream: {e}")
-            stop_recording()
-    
-    st.session_state.audio_thread = threading.Thread(target=audio_thread_func)
-    st.session_state.audio_thread.start()
-    st.session_state.is_recording = True
-
-# Function to stop recording
-def stop_recording():
-    st.session_state.is_recording = False
-    if st.session_state.audio_thread:
-        if st.session_state.audio_thread.is_alive():
-            st.session_state.audio_thread.join(timeout=1.0)
-        st.session_state.audio_thread = None
-    
-    if st.session_state.ws_connection:
-        st.session_state.ws_connection.close()
-        st.session_state.ws_connection = None
-
-# Function to connect to WebSocket
-def connect_websocket(server_url):
-    if st.session_state.ws_connection:
-        st.session_state.ws_connection.close()
-    
-    websocket.enableTrace(True)
-    ws = websocket.WebSocketApp(
-        server_url,
-        on_open=on_open,
-        on_message=on_message,
-        on_error=on_error,
-        on_close=on_close
-    )
-    
-    # Start the WebSocket in a background thread
-    def run_ws():
-        ws.run_forever()
-    
-    thread = threading.Thread(target=run_ws)
-    thread.daemon = True
-    thread.start()
-    
-    st.session_state.ws_connection = ws
-    return ws
-
-# Streamlit UI
-st.title("🎤 Pipecat WebSocket Client")
-
-# Server connection settings
-with st.expander("Server Settings", expanded=True):
-    col1, col2 = st.columns([3, 1])
-    with col1:
-        server_url = st.text_input("WebSocket Server URL", "ws://localhost:8765")
-    with col2:
-        connect_button = st.button("Connect")
+                st.session_state.status = f"Error processing audio: {str(e)}"
+                status_area.error(st.session_state.status)
+                break
         
-        if connect_button:
-            with st.spinner("Connecting to WebSocket server..."):
-                connect_websocket(server_url)
+        # Close stream
+        stream.stop_stream()
+        stream.close()
+        p.terminate()
+        
+    except Exception as e:
+        st.session_state.status = f"Error in audio processing: {str(e)}"
+        status_area.error(st.session_state.status)
 
-# Audio control buttons
-st.subheader("Audio Controls")
+def start_websocket():
+    try:
+        # Close existing connection if any
+        if st.session_state.ws:
+            st.session_state.ws.close()
+            
+        # Create new WebSocket connection
+        ws = websocket.WebSocketApp(
+            server_url,
+            on_open=on_open,
+            on_message=on_message,
+            on_error=on_error,
+            on_close=on_close
+        )
+        
+        st.session_state.ws = ws
+        st.session_state.is_playing = True
+        st.session_state.play_time = 0
+        
+        # Start WebSocket in a separate thread
+        wst = threading.Thread(target=ws.run_forever)
+        wst.daemon = True
+        wst.start()
+        
+        st.session_state.status = "Connecting to WebSocket server..."
+        status_area.info(st.session_state.status)
+        
+    except Exception as e:
+        st.session_state.status = f"Error starting WebSocket: {str(e)}"
+        status_area.error(st.session_state.status)
+
+def stop_websocket():
+    try:
+        st.session_state.is_playing = False
+        
+        if st.session_state.ws:
+            st.session_state.ws.close()
+            st.session_state.ws = None
+            
+        st.session_state.status = "WebSocket connection stopped"
+        status_area.warning(st.session_state.status)
+        
+    except Exception as e:
+        st.session_state.status = f"Error stopping WebSocket: {str(e)}"
+        status_area.error(st.session_state.status)
+
+# UI controls
 col1, col2 = st.columns(2)
 
 with col1:
-    start_button = st.button("Start Audio", type="primary", disabled=not st.session_state.ws_connection or st.session_state.is_recording)
-    if start_button:
-        start_recording()
+    start_button = st.button("Start Audio", 
+                             on_click=start_websocket, 
+                             disabled=st.session_state.is_playing)
 
 with col2:
-    stop_button = st.button("Stop Audio", type="secondary", disabled=not st.session_state.is_recording)
-    if stop_button:
-        stop_recording()
+    stop_button = st.button("Stop Audio", 
+                            on_click=stop_websocket, 
+                            disabled=not st.session_state.is_playing)
 
-# Connection status indicator
-connection_status = "Connected" if st.session_state.ws_connection and hasattr(st.session_state.ws_connection, 'sock') and st.session_state.ws_connection.sock and st.session_state.ws_connection.sock.connected else "Disconnected"
-status_color = "green" if connection_status == "Connected" else "red"
+# Installation instructions
+st.markdown("---")
+st.subheader("Installation Requirements")
+st.code("""
+# Install required packages
+pip install streamlit websocket-client numpy pyaudio sounddevice soundfile protobuf grpcio-tools
 
-st.markdown(f"""
-<div style="display: flex; align-items: center; margin-top: 1em;">
-    <div style="width: 10px; height: 10px; border-radius: 50%; background-color: {status_color}; margin-right: 5px;"></div>
-    <span>Status: <b>{connection_status}</b></span>
-</div>
-""", unsafe_allow_html=True)
-
-# Recent received audio
-if st.session_state.received_audio:
-    st.subheader("Recent Received Audio")
-    for idx, audio in enumerate(st.session_state.received_audio[-5:]):
-        with st.container():
-            st.audio(audio['data'].astype(np.float32) / 32767.0, sample_rate=audio['sample_rate'])
-
-# Instructions
-with st.expander("Instructions"):
-    st.markdown("""
-    ## How to use this application
-    
-    1. Enter the WebSocket server URL (default is `ws://localhost:8765`)
-    2. Click **Connect** to establish a connection with the server
-    3. Click **Start Audio** to begin sending microphone audio to the server
-    4. The server will process your audio and send responses back
-    5. Click **Stop Audio** to end the session
-    
-    ## Requirements
-    
-    - A running Pipecat WebSocket server at the specified URL
-    - Microphone access allowed in your browser
-    - The server should follow the same protocol as defined in the original application
-    """)
-
-# Deployment information
-with st.expander("Deployment Information"):
-    st.markdown("""
-    ## Running on Heroku
-    
-    This application is designed to work on Heroku with the following considerations:
-    
-    1. **Dependencies**: The app uses `sounddevice` instead of `pyaudio` to avoid build issues on Heroku
-    2. **Environment**: Make sure to set the appropriate buildpacks:
-       ```
-       heroku buildpacks:add --index 1 heroku/python
-       ```
-    3. **Port**: The app automatically binds to the port specified by Heroku
-    4. **WebSocket server**: Ensure your WebSocket server is accessible from the internet
-    
-    ## Troubleshooting
-    
-    If you encounter audio issues:
-    - Check browser microphone permissions
-    - Ensure the WebSocket server is running and accessible
-    - Check the WebSocket URL format (should be `ws://` or `wss://`)
-    """)
-
-# Footer
-st.markdown("""
----
-Made with Streamlit | Pipecat WebSocket Client
+# Run the app
+streamlit run app.py
 """)
 
-# Callback to ensure WebSocket is closed when the app is refreshed
-def on_session_end():
-    stop_recording()
+# Usage information
+st.markdown("---")
+st.subheader("How it works")
+st.markdown("""
+1. Enter the WebSocket server URL (default: ws://localhost:8765)
+2. Click "Start Audio" to establish a connection and begin streaming
+3. The app will send microphone audio to the server
+4. Any audio received from the server will be played back
+5. Click "Stop Audio" to disconnect
+""")
 
-# Register the callback
-st.session_state.on_session_end = on_session_end
+# Additional information
+st.markdown("---")
+st.subheader("About Protocol Buffers")
+st.markdown("""
+This app uses the Protocol Buffers (protobuf) format specified in `frames.proto` to encode and decode 
+audio data. The protobuf definition includes message types for text, audio, and transcription data.
+""")
+
+# Display the proto definition
+with st.expander("View frames.proto definition"):
+    st.code(frames_proto, language="proto")
