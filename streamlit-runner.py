@@ -209,27 +209,3 @@ with col2:
                             on_click=stop_websocket, 
                             disabled=not st.session_state.is_playing)
 
-# Usage information - using write instead of markdown
-st.write("---")
-st.header("How to use")
-st.write("1. Make sure you have created the frames.proto file in the same directory as this app")
-st.write("2. Run the command to generate protocol buffer classes: python -m grpc_tools.protoc --proto_path=./ --python_out=./ frames.proto")
-st.write("3. Enter the WebSocket server URL (default: ws://localhost:8765)")
-st.write("4. Click \"Start Audio\" to establish a connection and begin streaming")
-st.write("5. The app will send microphone audio to the server")
-st.write("6. Any audio received from the server will be played back")
-st.write("7. Click \"Stop Audio\" to disconnect")
-
-# Display debugging information
-with st.expander("Debug Information"):
-    st.write("Current Status")
-    st.write(f"Connection status: {'Connected' if st.session_state.is_playing else 'Disconnected'}")
-    st.write(f"WebSocket URL: {server_url}")
-    st.write(f"Sample rate: {SAMPLE_RATE} Hz")
-    
-    if os.path.exists("frames.proto"):
-        st.success("frames.proto file exists")
-        with open("frames.proto", "r") as f:
-            st.code(f.read(), language="proto")
-    else:
-        st.error("frames.proto file not found in the current directory")
