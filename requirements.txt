@@ -1,6 +1,5 @@
 streamlit==1.43.0
 websocket-client
-numpy
 pyaudio
 sounddevice
 protobuf3-to-dict
