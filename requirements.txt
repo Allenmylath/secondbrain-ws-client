@@ -1,6 +1,7 @@
 streamlit
 websocket-client
-pyaudio
 numpy
 sounddevice
 protobuf3-to-dict
+cffi
+python-dotenv
