@@ -3,16 +3,11 @@ import websocket
 import threading
 import numpy as np
 import time
-import json
 import pyaudio
-import wave
-import io
-import os
-from google.protobuf.descriptor_pb2 import FileDescriptorSet
-from google.protobuf.message_factory import MessageFactory
-from google.protobuf.descriptor_pool import DescriptorPool
 import sounddevice as sd
-import soundfile as sf
+import os
+from google.protobuf.descriptor_pool import DescriptorPool
+from google.protobuf.message_factory import MessageFactory
 
 # Set page configuration
 st.set_page_config(page_title="Pipecat WebSocket Client", layout="wide")
@@ -24,50 +19,36 @@ CHUNK_SIZE = 512
 FORMAT = pyaudio.paInt16
 PLAY_TIME_RESET_THRESHOLD_MS = 1.0
 
-# Create frames.proto file
-frames_proto = """
-//
-// Copyright (c) 2024–2025, Daily
-//
-// SPDX-License-Identifier: BSD 2-Clause License
-//
-// Generate frames_pb2.py with:
-//
-//   python -m grpc_tools.protoc --proto_path=./ --python_out=./protobufs frames.proto
-syntax = "proto3";
-package pipecat;
-message TextFrame {
-  uint64 id = 1;
-  string name = 2;
-  string text = 3;
-}
-message AudioRawFrame {
-  uint64 id = 1;
-  string name = 2;
-  bytes audio = 3;
-  uint32 sample_rate = 4;
-  uint32 num_channels = 5;
-  optional uint64 pts = 6;
-}
-message TranscriptionFrame {
-  uint64 id = 1;
-  string name = 2;
-  string text = 3;
-  string user_id = 4;
-  string timestamp = 5;
-}
-message Frame {
-  oneof frame {
-    TextFrame text = 1;
-    AudioRawFrame audio = 2;
-    TranscriptionFrame transcription = 3;
-  }
-}
-"""
+# Check if frames_pb2.py exists, otherwise generate it
+if not os.path.exists("frames_pb2.py"):
+    try:
+        import subprocess
+        st.info("Generating protobuf classes from frames.proto...")
+        result = subprocess.run([
+            "python", "-m", "grpc_tools.protoc", 
+            "--proto_path=./", 
+            "--python_out=./", 
+            "frames.proto"
+        ], capture_output=True, text=True)
+        
+        if result.returncode != 0:
+            st.error(f"Error generating protobuf classes: {result.stderr}")
+        else:
+            st.success("Generated protobuf classes successfully")
+    except Exception as e:
+        st.error(f"Error generating protobuf classes: {str(e)}")
+        st.info("Please run this command manually:")
+        st.code("python -m grpc_tools.protoc --proto_path=./ --python_out=./ frames.proto")
 
-# Write the proto file to disk
-with open("frames.proto", "w") as f:
-    f.write(frames_proto)
+# Import the generated protobuf module
+try:
+    import frames_pb2
+    st.success("Successfully imported frames_pb2")
+except ImportError:
+    st.error("Could not import frames_pb2. Make sure frames.proto has been compiled.")
+    st.info("Please run this command manually:")
+    st.code("python -m grpc_tools.protoc --proto_path=./ --python_out=./ frames.proto")
+    st.stop()
 
 # Initialize session state
 if 'ws' not in st.session_state:
@@ -83,40 +64,6 @@ if 'play_time' not in st.session_state:
 if 'last_message_time' not in st.session_state:
     st.session_state.last_message_time = 0
 
-# Generate Python protobuf classes
-try:
-    import subprocess
-    result = subprocess.run([
-        "python", "-m", "grpc_tools.protoc", 
-        "--proto_path=./", 
-        "--python_out=./", 
-        "frames.proto"
-    ], capture_output=True, text=True)
-    
-    if result.returncode != 0:
-        st.error(f"Error generating protobuf classes: {result.stderr}")
-    else:
-        st.success("Generated protobuf classes successfully")
-        
-    # Import the generated module
-    import frames_pb2
-except Exception as e:
-    st.error(f"Error setting up protobuf: {str(e)}")
-    st.info("Trying alternative approach with dynamic loading...")
-    
-    # Alternative: Create descriptor pool and load message types dynamically
-    from google.protobuf.compiler import plugin_pb2
-    from google.protobuf import descriptor_pb2
-    from google.protobuf.descriptor_pool import DescriptorPool
-    from google.protobuf.message_factory import MessageFactory
-    
-    pool = DescriptorPool()
-    with open("frames.proto", "rb") as f:
-        proto_content = f.read()
-        
-    # This part would need protoc to be installed and called
-    # For now, we'll assume frames_pb2 is generated
-
 # Main app
 st.title("Pipecat WebSocket Client")
 st.subheader("Connect to a WebSocket server for voice communication")
@@ -127,12 +74,6 @@ server_url = st.text_input("WebSocket Server URL", value="ws://localhost:8765")
 # Status area
 status_area = st.empty()
 status_area.info(st.session_state.status)
-
-# Convert Float32 audio to S16PCM
-def convert_float32_to_s16pcm(float32_array):
-    float32_array = np.clip(float32_array, -1.0, 1.0)
-    int16_array = (float32_array * 32767).astype(np.int16)
-    return int16_array.tobytes()
 
 # WebSocket callback functions
 def on_message(ws, message):
@@ -292,36 +233,29 @@ with col2:
                             on_click=stop_websocket, 
                             disabled=not st.session_state.is_playing)
 
-# Installation instructions
-st.markdown("---")
-st.subheader("Installation Requirements")
-st.code("""
-# Install required packages
-pip install streamlit websocket-client numpy pyaudio sounddevice soundfile protobuf grpcio-tools
-
-# Run the app
-streamlit run app.py
-""")
-
 # Usage information
 st.markdown("---")
-st.subheader("How it works")
+st.subheader("How to use")
 st.markdown("""
-1. Enter the WebSocket server URL (default: ws://localhost:8765)
-2. Click "Start Audio" to establish a connection and begin streaming
-3. The app will send microphone audio to the server
-4. Any audio received from the server will be played back
-5. Click "Stop Audio" to disconnect
+1. Make sure you have created the `frames.proto` file in the same directory as this app
+2. Run the command to generate protocol buffer classes: `python -m grpc_tools.protoc --proto_path=./ --python_out=./ frames.proto`
+3. Enter the WebSocket server URL (default: ws://localhost:8765)
+4. Click "Start Audio" to establish a connection and begin streaming
+5. The app will send microphone audio to the server
+6. Any audio received from the server will be played back
+7. Click "Stop Audio" to disconnect
 """)
 
-# Additional information
-st.markdown("---")
-st.subheader("About Protocol Buffers")
-st.markdown("""
-This app uses the Protocol Buffers (protobuf) format specified in `frames.proto` to encode and decode 
-audio data. The protobuf definition includes message types for text, audio, and transcription data.
-""")
-
-# Display the proto definition
-with st.expander("View frames.proto definition"):
-    st.code(frames_proto, language="proto")
+# Display debugging information
+with st.expander("Debug Information"):
+    st.markdown("### Current Status")
+    st.write(f"Connection status: {'Connected' if st.session_state.is_playing else 'Disconnected'}")
+    st.write(f"WebSocket URL: {server_url}")
+    st.write(f"Sample rate: {SAMPLE_RATE} Hz")
+    
+    if os.path.exists("frames.proto"):
+        st.success("frames.proto file exists")
+        with open("frames.proto", "r") as f:
+            st.code(f.read(), language="proto")
+    else:
+        st.error("frames.proto file not found in the current directory")
