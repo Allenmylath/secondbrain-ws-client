@@ -8,6 +8,9 @@ import os
 import asyncio
 import concurrent.futures
 import logging
+import socket
+import platform
+import sys
 from datetime import datetime
 from google.protobuf.descriptor_pool import DescriptorPool
 from google.protobuf.message_factory import MessageFactory
@@ -16,6 +19,9 @@ from google.protobuf.message_factory import MessageFactory
 logging.basicConfig(level=logging.DEBUG, 
                    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
 logger = logging.getLogger("pipecat_websocket")
+
+# Log environment info at startup
+log_environment_info()
 
 # Set page configuration
 st.set_page_config(page_title="Pipecat WebSocket Client", layout="wide")
@@ -31,6 +37,18 @@ PLAY_TIME_RESET_THRESHOLD_MS = 1.0
 
 logger.debug(f"Constants initialized: SAMPLE_RATE={SAMPLE_RATE}, CHANNELS={NUM_CHANNELS}, CHUNK={CHUNK_SIZE}")
 
+# Log environment info at startup
+def log_environment_info():
+    """Log detailed information about the environment"""
+    logger.debug("--- ENVIRONMENT INFORMATION ---")
+    logger.debug(f"Python version: {sys.version}")
+    logger.debug(f"Platform: {platform.platform()}")
+    logger.debug(f"Websocket-client version: {websocket.__version__}")
+    logger.debug(f"Numpy version: {np.__version__}")
+    logger.debug(f"PyAudio version: {pyaudio.__version__ if hasattr(pyaudio, '__version__') else 'Unknown'}")
+    logger.debug(f"Sounddevice version: {sd.__version__ if hasattr(sd, '__version__') else 'Unknown'}")
+    logger.debug("-----------------------------")
+
 # Debug function for session state
 def log_session_state(message=""):
     """Log the current state of all session variables"""
@@ -39,6 +57,16 @@ def log_session_state(message=""):
         if key == 'ws':
             state = "Connected" if value and hasattr(value, 'sock') and value.sock else "Disconnected"
             logger.debug(f"  {key}: {state}")
+            # Add more detailed WebSocket info if connected
+            if value and hasattr(value, 'sock') and value.sock:
+                try:
+                    sock_timeout = value.sock.gettimeout()
+                    sock_family = value.sock.family
+                    sock_type = value.sock.type
+                    sock_proto = value.sock.proto
+                    logger.debug(f"  WebSocket details: timeout={sock_timeout}, family={sock_family}, type={sock_type}, proto={sock_proto}")
+                except Exception as e:
+                    logger.debug(f"  Error getting WebSocket details: {e}")
         elif key == 'audio_queue':
             logger.debug(f"  {key}: {len(value)} items in queue")
         elif key == 'executor' or key == 'loop':
@@ -204,7 +232,22 @@ def on_close(ws, close_status_code, close_msg):
     msg = f"WebSocket connection closed: code={close_status_code}, message={close_msg}"
     logger.info(msg)
     add_debug_message(msg)
-    update_status("WebSocket connection closed", "warning")
+    
+    # Check for timeout issue
+    if close_status_code == 1006:  # 1006 is "Abnormal Closure"
+        add_debug_message("DETECTED ABNORMAL CLOSURE - Possible timeout issue (ws timeout 13)")
+        
+        # Get socket details if available
+        if hasattr(ws, 'sock') and ws.sock:
+            try:
+                add_debug_message(f"Socket timeout at close: {ws.sock.gettimeout()}")
+            except:
+                add_debug_message("Could not get socket timeout at close")
+        
+        update_status("WebSocket connection closed abnormally - possible timeout", "error")
+    else:
+        update_status("WebSocket connection closed", "warning")
+    
     st.session_state.is_playing = False
     log_session_state("after connection closed")
 
@@ -212,6 +255,12 @@ def on_open(ws):
     logger.info("WebSocket connection established")
     add_debug_message("WebSocket connection established")
     update_status("WebSocket connection established", "success")
+    
+    # Log WebSocket properties
+    if hasattr(ws, 'sock') and ws.sock:
+        add_debug_message(f"WebSocket details - Local: {ws.sock.getsockname()}, Remote: {ws.sock.getpeername()}")
+        timeout = ws.sock.gettimeout()
+        add_debug_message(f"WebSocket timeout: {timeout}s")
     
     # Start audio processing in the executor
     add_debug_message("Submitting audio processing task to executor")
@@ -303,8 +352,12 @@ def start_websocket():
             add_debug_message("Closing existing WebSocket connection")
             st.session_state.ws.close()
             
-        # Create new WebSocket connection
-        add_debug_message("Creating new WebSocket connection")
+        # Create new WebSocket connection with custom settings
+        add_debug_message("Creating new WebSocket connection with debug trace enabled")
+        
+        # Enable websocket-client trace for debugging
+        websocket.enableTrace(True)
+        
         ws = websocket.WebSocketApp(
             server_url,
             on_open=on_open,
@@ -319,17 +372,35 @@ def start_websocket():
         st.session_state.audio_packets_sent = 0
         st.session_state.audio_packets_received = 0
         
-        # Enable heartbeats and reconnection
-        add_debug_message("Enabling WebSocket multithread mode")
+        # Enable heartbeats and reconnection with more frequent pings
+        add_debug_message("Enabling WebSocket multithread mode with enhanced heartbeat")
         ws.enable_multithread = True
         
+        # Adjust socket options before connecting
+        def on_create_connection(wcapp):
+            add_debug_message("Setting socket options before connection")
+            wcapp.sock.settimeout(30.0)  # Longer timeout to prevent "ws timeout 13"
+            # Set keepalive options if supported by platform
+            if hasattr(socket, 'SO_KEEPALIVE'):
+                wcapp.sock.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
+                add_debug_message("Enabled SO_KEEPALIVE")
+                # Set keepalive parameters if available (Linux)
+                if hasattr(socket, 'TCP_KEEPIDLE'):
+                    wcapp.sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPIDLE, 30)
+                    wcapp.sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPINTVL, 3)
+                    wcapp.sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPCNT, 5)
+                    add_debug_message("Set TCP keepalive parameters")
+        
+        ws.on_create_connection = on_create_connection
+                
         # Use ThreadPoolExecutor to run the WebSocket
-        add_debug_message("Submitting WebSocket run_forever to executor")
+        add_debug_message("Submitting WebSocket run_forever to executor with adjusted parameters")
         future = st.session_state.executor.submit(
             ws.run_forever,
-            ping_interval=30,  # Send ping every 30 seconds
+            ping_interval=15,  # More frequent pings (15 seconds instead of 30)
             ping_timeout=10,   # Wait 10 seconds for pong
-            reconnect=5        # Try to reconnect 5 times
+            reconnect=5,       # Try to reconnect 5 times
+            skip_utf8_validation=True  # Skip UTF-8 validation for better performance
         )
         st.session_state.tasks.append(future)
         
