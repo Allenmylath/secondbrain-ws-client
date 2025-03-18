@@ -209,18 +209,6 @@ with col2:
                             on_click=stop_websocket, 
                             disabled=not st.session_state.is_playing)
 
-# Usage information
-st.markdown("---")
-st.subheader("How to use")
-st.markdown("""
-1. Make sure you have created the `frames.proto` file in the same directory as this app
-2. Run the command to generate protocol buffer classes: `python -m grpc_tools.protoc --proto_path=./ --python_out=./ frames.proto`
-3. Enter the WebSocket server URL (default: ws://localhost:8765)
-4. Click "Start Audio" to establish a connection and begin streaming
-5. The app will send microphone audio to the server
-6. Any audio received from the server will be played back
-7. Click "Stop Audio" to disconnect
-""")
 
 # Display debugging information
 with st.expander("Debug Information"):
