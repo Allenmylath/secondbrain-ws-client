@@ -36,6 +36,8 @@ if 'audio_queue' not in st.session_state:
     st.session_state.audio_queue = []
 if 'status' not in st.session_state:
     st.session_state.status = "Ready to connect"
+if 'status_type' not in st.session_state:
+    st.session_state.status_type = "info"  # Can be "info", "success", "warning", "error"
 if 'play_time' not in st.session_state:
     st.session_state.play_time = 0
 if 'last_message_time' not in st.session_state:
@@ -47,6 +49,11 @@ if 'loop' not in st.session_state:
 if 'tasks' not in st.session_state:
     st.session_state.tasks = []
 
+# Function to update status (use this instead of directly updating the UI)
+def update_status(message, status_type="info"):
+    st.session_state.status = message
+    st.session_state.status_type = status_type
+
 # Main app
 st.title("Pipecat WebSocket Client")
 st.header("Connect to a WebSocket server for voice communication")
@@ -54,9 +61,16 @@ st.header("Connect to a WebSocket server for voice communication")
 # Server URL input
 server_url = st.text_input("WebSocket Server URL", value="ws://localhost:8765")
 
-# Status area
+# Status area - updates based on session state
 status_area = st.empty()
-status_area.info(st.session_state.status)
+if st.session_state.status_type == "info":
+    status_area.info(st.session_state.status)
+elif st.session_state.status_type == "success":
+    status_area.success(st.session_state.status)
+elif st.session_state.status_type == "warning":
+    status_area.warning(st.session_state.status)
+elif st.session_state.status_type == "error":
+    status_area.error(st.session_state.status)
 
 # Play audio using sounddevice in a ThreadPoolExecutor
 def play_audio(audio_data):
@@ -90,24 +104,19 @@ def on_message(ws, message):
             # Play audio in the thread pool
             if st.session_state.is_playing:
                 st.session_state.executor.submit(play_audio, audio_data)
-                st.session_state.status = "Received audio data"
-                status_area.info(st.session_state.status)
+                update_status("Received audio data", "info")
     except Exception as e:
-        st.session_state.status = f"Error processing message: {str(e)}"
-        status_area.error(st.session_state.status)
+        update_status(f"Error processing message: {str(e)}", "error")
 
 def on_error(ws, error):
-    st.session_state.status = f"WebSocket error: {str(error)}"
-    status_area.error(st.session_state.status)
+    update_status(f"WebSocket error: {str(error)}", "error")
 
 def on_close(ws, close_status_code, close_msg):
-    st.session_state.status = "WebSocket connection closed"
-    status_area.warning(st.session_state.status)
+    update_status("WebSocket connection closed", "warning")
     st.session_state.is_playing = False
 
 def on_open(ws):
-    st.session_state.status = "WebSocket connection established"
-    status_area.success(st.session_state.status)
+    update_status("WebSocket connection established", "success")
     
     # Start audio processing in the executor
     future = st.session_state.executor.submit(process_audio, ws)
@@ -127,7 +136,7 @@ def process_audio(ws):
             frames_per_buffer=CHUNK_SIZE
         )
         
-        st.session_state.status = "Audio stream started"
+        update_status("Audio stream started", "info")
         
         # Process audio while the connection is active
         while st.session_state.is_playing and ws.sock and ws.sock.connected:
@@ -145,7 +154,7 @@ def process_audio(ws):
                 ws.send(frame.SerializeToString())
                 
             except Exception as e:
-                st.session_state.status = f"Error processing audio: {str(e)}"
+                update_status(f"Error processing audio: {str(e)}", "error")
                 break
         
         # Close stream
@@ -154,7 +163,7 @@ def process_audio(ws):
         p.terminate()
         
     except Exception as e:
-        st.session_state.status = f"Error in audio processing: {str(e)}"
+        update_status(f"Error in audio processing: {str(e)}", "error")
 
 # Async function to run WebSocket
 async def run_websocket(ws):
@@ -180,16 +189,22 @@ def start_websocket():
         st.session_state.is_playing = True
         st.session_state.play_time = 0
         
+        # Enable heartbeats and reconnection
+        ws.enable_multithread = True
+        
         # Use ThreadPoolExecutor to run the WebSocket
-        future = st.session_state.executor.submit(ws.run_forever)
+        future = st.session_state.executor.submit(
+            ws.run_forever,
+            ping_interval=30,  # Send ping every 30 seconds
+            ping_timeout=10,   # Wait 10 seconds for pong
+            reconnect=5        # Try to reconnect 5 times
+        )
         st.session_state.tasks.append(future)
         
-        st.session_state.status = "Connecting to WebSocket server..."
-        status_area.info(st.session_state.status)
+        update_status("Connecting to WebSocket server...", "info")
         
     except Exception as e:
-        st.session_state.status = f"Error starting WebSocket: {str(e)}"
-        status_area.error(st.session_state.status)
+        update_status(f"Error starting WebSocket: {str(e)}", "error")
 
 def stop_websocket():
     try:
@@ -202,15 +217,16 @@ def stop_websocket():
         # Cancel any pending tasks
         for task in st.session_state.tasks:
             if not task.done():
-                task.cancel()
+                try:
+                    task.cancel()
+                except Exception:
+                    pass
         st.session_state.tasks = []
             
-        st.session_state.status = "WebSocket connection stopped"
-        status_area.warning(st.session_state.status)
+        update_status("WebSocket connection stopped", "warning")
         
     except Exception as e:
-        st.session_state.status = f"Error stopping WebSocket: {str(e)}"
-        status_area.error(st.session_state.status)
+        update_status(f"Error stopping WebSocket: {str(e)}", "error")
 
 # Cleanup function for session shutdown
 def cleanup():
@@ -220,6 +236,11 @@ def cleanup():
 # Register cleanup handler
 import atexit
 atexit.register(cleanup)
+
+# Add heartbeat display
+last_received = st.empty()
+if st.session_state.last_message_time > 0:
+    last_received.text(f"Last audio received: {time.strftime('%H:%M:%S', time.localtime(st.session_state.last_message_time))}")
 
 # UI controls
 col1, col2 = st.columns(2)
