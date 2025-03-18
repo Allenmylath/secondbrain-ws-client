@@ -42,7 +42,7 @@ if 'last_message_time' not in st.session_state:
 
 # Main app
 st.title("Pipecat WebSocket Client")
-st.subheader("Connect to a WebSocket server for voice communication")
+st.header("Connect to a WebSocket server for voice communication")
 
 # Server URL input
 server_url = st.text_input("WebSocket Server URL", value="ws://localhost:8765")
@@ -209,9 +209,9 @@ with col2:
                             on_click=stop_websocket, 
                             disabled=not st.session_state.is_playing)
 
-# Usage information - replaced markdown with text
+# Usage information - using write instead of markdown
 st.write("---")
-st.subheader("How to use")
+st.header("How to use")
 st.write("1. Make sure you have created the frames.proto file in the same directory as this app")
 st.write("2. Run the command to generate protocol buffer classes: python -m grpc_tools.protoc --proto_path=./ --python_out=./ frames.proto")
 st.write("3. Enter the WebSocket server URL (default: ws://localhost:8765)")
