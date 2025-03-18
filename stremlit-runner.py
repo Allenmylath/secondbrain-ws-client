@@ -1,7 +1,6 @@
 import streamlit as st
 import websocket
 import threading
-import pyaudio
 import numpy as np
 import time
 import base64
@@ -21,7 +20,6 @@ st.set_page_config(
 SAMPLE_RATE = 16000
 NUM_CHANNELS = 1
 CHUNK_SIZE = 512
-FORMAT = pyaudio.paInt16
 
 # Simple ProtoBuffer implementation for Frame message
 class AudioData(Message):
@@ -107,10 +105,14 @@ def start_recording():
     
     # Start the audio recording in a separate thread
     def audio_thread_func():
-        with sd.InputStream(samplerate=SAMPLE_RATE, channels=NUM_CHANNELS, 
-                           callback=audio_callback, blocksize=CHUNK_SIZE):
-            while st.session_state.is_recording:
-                time.sleep(0.1)
+        try:
+            with sd.InputStream(samplerate=SAMPLE_RATE, channels=NUM_CHANNELS, 
+                            callback=audio_callback, blocksize=CHUNK_SIZE):
+                while st.session_state.is_recording:
+                    time.sleep(0.1)
+        except Exception as e:
+            st.error(f"Error with audio stream: {e}")
+            stop_recording()
     
     st.session_state.audio_thread = threading.Thread(target=audio_thread_func)
     st.session_state.audio_thread.start()
@@ -152,17 +154,6 @@ def connect_websocket(server_url):
     
     st.session_state.ws_connection = ws
     return ws
-
-# Function to get audio data for playback
-def get_audio_playback_html(audio_data, sample_rate):
-    audio_bytes = audio_data.tobytes()
-    audio_base64 = base64.b64encode(audio_bytes).decode()
-    return f"""
-    <audio controls autoplay>
-      <source src="data:audio/wav;base64,{audio_base64}" type="audio/wav">
-      Your browser does not support the audio element.
-    </audio>
-    """
 
 # Streamlit UI
 st.title("🎤 Pipecat WebSocket Client")
@@ -227,6 +218,29 @@ with st.expander("Instructions"):
     - A running Pipecat WebSocket server at the specified URL
     - Microphone access allowed in your browser
     - The server should follow the same protocol as defined in the original application
+    """)
+
+# Deployment information
+with st.expander("Deployment Information"):
+    st.markdown("""
+    ## Running on Heroku
+    
+    This application is designed to work on Heroku with the following considerations:
+    
+    1. **Dependencies**: The app uses `sounddevice` instead of `pyaudio` to avoid build issues on Heroku
+    2. **Environment**: Make sure to set the appropriate buildpacks:
+       ```
+       heroku buildpacks:add --index 1 heroku/python
+       ```
+    3. **Port**: The app automatically binds to the port specified by Heroku
+    4. **WebSocket server**: Ensure your WebSocket server is accessible from the internet
+    
+    ## Troubleshooting
+    
+    If you encounter audio issues:
+    - Check browser microphone permissions
+    - Ensure the WebSocket server is running and accessible
+    - Check the WebSocket URL format (should be `ws://` or `wss://`)
     """)
 
 # Footer
